@@ -203,8 +203,8 @@ class DifferentialCausalSelfAttention(nn.Module):
 
         # Apply rotary embeddings
         cos, sin = self.rotary(q)
-        q = F.rms_norm(q, (q.size(-1),))
-        k = F.rms_norm(k, (k.size(-1),))
+        q = F.RMSNorm(q, (q.size(-1),))
+        k = F.RMSNorm(k, (k.size(-1),))
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
 
@@ -277,8 +277,8 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x):
-        x = x + self.attn(F.rms_norm(x, (x.size(-1),)))
-        x = x + self.mlp(F.rms_norm(x, (x.size(-1),)))
+        x = x + self.attn(F.RMSNorm(x, (x.size(-1),)))
+        x = x + self.mlp(F.RMSNorm(x, (x.size(-1),)))
         return x
 
 # -----------------------------------------------------------------------------
@@ -310,7 +310,7 @@ class GPT(nn.Module):
         x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         for block in self.transformer.h:
             x = block(x)
-        x = F.rms_norm(x, (x.size(-1),))
+        x = F.RMSNorm(x, (x.size(-1),))
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
