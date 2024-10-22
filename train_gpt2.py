@@ -109,7 +109,7 @@ class Muon(torch.optim.Optimizer):
                         curr_idx += p.numel()
                         continue
                     if len(g.shape) != 2:
-                        # print(f"Skipping gradient for param with shape: {g.shape}, not 2D.")
+                        print(f"Skipping gradient for param with shape: {g.shape}, not 2D.")
                         curr_idx += p.numel()  # Move the index forward, skip this gradient
                         continue
                     state = self.state[p]
