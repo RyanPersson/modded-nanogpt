@@ -15,7 +15,7 @@ import torch.distributed as dist
 import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 import math
-from flash_attn.flash_attn_interface import flash_attn_func
+
 
 # -----------------------------------------------------------------------------
 # Muon optimizer
@@ -146,26 +146,19 @@ class Rotary(torch.nn.Module):
             self.sin_cached = freqs.sin().bfloat16()
         return self.cos_cached[None, :, None, :], self.sin_cached[None, :, None, :]
 
-def apply_rotary_emb(x, cos, sin, interleaved=False):
-    if interleaved:
-        x1 = x[..., ::2]
-        x2 = x[..., 1::2]
-    else:
-        half = x.size(-1) // 2
-        x1 = x[..., :half]
-        x2 = x[..., half:]
-    y1 = x1 * cos - x2 * sin
-    y2 = x1 * sin + x2 * cos
-    if interleaved:
-        y = torch.stack((y1, y2), dim=-1).flatten(-2)
-    else:
-        y = torch.cat([y1, y2], dim=-1)
-    return y.type_as(x)
+def apply_rotary_emb(x, cos, sin):
+    assert x.ndim == 4 # multihead attention
+    d = x.shape[3]//2
+    x1 = x[..., :d]
+    x2 = x[..., d:]
+    y1 = x1 * cos + x2 * sin
+    y2 = x1 * (-sin) + x2 * cos
+    return torch.cat([y1, y2], 3).type_as(x)
 
 def lambda_init_fn(depth):
     return 0.8 - 0.6 * math.exp(-0.3 * depth)
 
-class DifferentialFlashAttention(nn.Module):
+class DifferentialCausalSelfAttention(nn.Module):
 
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -186,71 +179,63 @@ class DifferentialFlashAttention(nn.Module):
 
         # Lambda parameters (For differential attention)
         self.lambda_init = lambda_init_fn(self.depth)
-        self.lambda_q1 = nn.Parameter(torch.randn(self.head_dim) * 0.1)
-        self.lambda_k1 = nn.Parameter(torch.randn(self.head_dim) * 0.1)
-        self.lambda_q2 = nn.Parameter(torch.randn(self.head_dim) * 0.1)
-        self.lambda_k2 = nn.Parameter(torch.randn(self.head_dim) * 0.1)
-
-        # Sub-layer normalization
-        self.subln = nn.LayerNorm(2 * self.head_dim, eps=1e-5, elementwise_affine=False)
-
+        self.lambda_q1 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
+        self.lambda_k1 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
+        self.lambda_q2 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
+        self.lambda_k2 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
+        
+        self.subln = nn.RMSNorm(2 * self.head_dim, eps=1e-5)  # dim corresponds to model dimension
+    
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
         # Compute query, key, and value projections
+
         # Reshape for differential attention
-        q = self.c_q(x).view(B, T, 2 * self.n_head, self.head_dim)  # (B, T, 2*n_head, head_dim)
-        k = self.c_k(x).view(B, T, 2 * self.n_head, self.head_dim)
-        v = self.c_v(x).view(B, T, self.n_head, 2, self.head_dim)
-        # Apply rotary embeddings
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+
+        q = q.view(B, T, 2 * self.num_heads, self.head_dim)
+        k = k.view(B, T, 2 * self.num_kv_heads, self.head_dim)
+        v = v.view(B, T, self.num_kv_heads, 2 * self.head_dim)
+
         cos, sin = self.rotary(q)
-        q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),)) # QK norm suggested by @Grad62304977
-        q = apply_rotary_emb(q, cos, sin, interleaved=True)
-        k = apply_rotary_emb(k, cos, sin, interleaved=True)
+        q = F.rms_norm(q, (q.size(-1),)) 
+        k = F.rms_norm(k, (k.size(-1),)) # QK norm suggested by @Grad62304977
+        
+        q = apply_rotary_emb(q, cos, sin)
+        k = apply_rotary_emb(k, cos, sin)
+        
+        q *= self.scaling
 
-        # Reshape and split into components
-        q = q.view(B, T, self.n_head, 2, self.head_dim)
-        k = k.view(B, T, self.n_head, 2, self.head_dim)
-        v = v.view(B, T, self.n_head, 2, self.head_dim)
-        q1, q2 = q[:, :, :, 0], q[:, :, :, 1]
-        k1, k2 = k[:, :, :, 0], k[:, :, :, 1]
-        v1, v2 = v[:, :, :, 0], v[:, :, :, 1]
+        attn_weights = torch.matmul(q, k.transpose(-1, -2))
 
-        # Reshape for flash attention
-        q1 = q1.reshape(B * self.n_head, T, self.head_dim)
-        k1 = k1.reshape(B * self.n_head, T, self.head_dim)
-        v1 = v1.reshape(B * self.n_head, T, self.head_dim)
-        q2 = q2.reshape(B * self.n_head, T, self.head_dim)
-        k2 = k2.reshape(B * self.n_head, T, self.head_dim)
-        v2 = v2.reshape(B * self.n_head, T, self.head_dim)
+        # if attn_mask is None:
+        #     attn_mask = torch.triu(
+        #         torch.zeros([T, T])
+        #         .float()
+        #         .fill_(float("-inf"))
+        #         .type_as(attn_weights),
+        #         1,
+        #     )
+        # attn_weights = torch.nan_to_num(attn_weights)
+        # attn_weights += attn_mask   
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).type_as(attn_weights)
 
-        # Compute attention outputs using flash attention
-        attn11 = flash_attn_func(q1, k1, v1, causal=True)
-        attn12 = flash_attn_func(q1, k1, v2, causal=True)
-        attn1 = torch.cat([attn11, attn12], dim=-1)  # (B*n_head, T, 2*head_dim)
-
-        attn21 = flash_attn_func(q2, k2, v1, causal=True)
-        attn22 = flash_attn_func(q2, k2, v2, causal=True)
-        attn2 = torch.cat([attn21, attn22], dim=-1)
-
-        # Compute lambda values
-        lambda_1 = torch.exp(torch.sum(self.lambda_q1 * self.lambda_k1)).type_as(q1)
-        lambda_2 = torch.exp(torch.sum(self.lambda_q2 * self.lambda_k2)).type_as(q1)
+        lambda_1 = torch.exp(torch.sum(self.lambda_q1 * self.lambda_k1, dim=-1).float()).type_as(q)
+        lambda_2 = torch.exp(torch.sum(self.lambda_q2 * self.lambda_k2, dim=-1).float()).type_as(q)
         lambda_full = lambda_1 - lambda_2 + self.lambda_init
-
-        # Combine attention outputs
-        attn = attn1 - lambda_full * attn2  # (B*n_head, T, 2*head_dim)
-
-        # Reshape back to (B, T, n_embd)
-        attn = attn.view(B, self.n_head, T, 2 * self.head_dim)
-        attn = attn.transpose(1, 2).contiguous().view(B, T, self.n_head * 2 * self.head_dim)
-
-        # Apply sub-layer normalization and scaling
+        attn_weights = attn_weights.view(B, self.num_heads, 2, T, T)
+        attn_weights = attn_weights[:, :, 0] - lambda_full * attn_weights[:, :, 1]
+        
+        attn = torch.matmul(attn_weights, v)
         attn = self.subln(attn)
         attn = attn * (1 - self.lambda_init)
+        attn = attn.transpose(1, 2).reshape(B, T, self.num_heads * 2 * self.head_dim)
 
-        # Output projection
-        y = self.c_proj(attn)
-        return y
+        attn = self.c_proj(attn)
+        return attn
+
 
 class MLP(nn.Module):
 
@@ -270,7 +255,7 @@ class Block(nn.Module):
 
     def __init__(self, config, layer_idx):
         super().__init__()
-        self.attn = DifferentialFlashAttention(config, layer_idx)
+        self.attn = DifferentialCausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
     def forward(self, x):
