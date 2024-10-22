@@ -488,15 +488,19 @@ raw_model = model.module  # always contains the "raw" unwrapped model
 ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
 
 # Initialize the optimizer(s)
+
 # Collect 'lambda' parameters
 lambda_params = []
 for block in raw_model.transformer.h:
     attn = block.attn
     lambda_params.extend([attn.lambda_q1, attn.lambda_k1, attn.lambda_q2, attn.lambda_k2])
 
-# Collect other parameters for Muon optimizer
+# Create a set of IDs for 'lambda' parameters
+lambda_param_ids = set(id(p) for p in lambda_params)
+
+# Collect other parameters for Muon optimizer by excluding 'lambda' parameters
 all_h_params = list(raw_model.transformer.h.parameters())
-params_for_muon = [p for p in all_h_params if p not in lambda_params]
+params_for_muon = [p for p in all_h_params if id(p) not in lambda_param_ids]
 
 # Optimizer for lm_head.parameters()
 optimizer1 = torch.optim.AdamW(
@@ -524,6 +528,7 @@ optimizer3 = torch.optim.AdamW(
     weight_decay=args.weight_decay,
     fused=True
 )
+
 optimizers = [optimizer1, optimizer2, optimizer3]
 # Learning rate schedulers
 def get_lr(it):
