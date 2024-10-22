@@ -488,11 +488,61 @@ raw_model = model.module  # always contains the "raw" unwrapped model
 ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
 
 # Initialize the optimizer(s)
-optimizer1 = torch.optim.AdamW(raw_model.lm_head.parameters(), lr=args.learning_rate,
-                               betas=(0.9, 0.95), weight_decay=args.weight_decay, fused=True)
-optimizer2 = Muon(raw_model.transformer.h.parameters(), lr=0.1 * args.learning_rate, momentum=0.95,
-                  rank=ddp_rank, world_size=ddp_world_size)
-optimizers = [optimizer1, optimizer2]
+# Collect 'lambda' parameters
+lambda_params = []
+for block in raw_model.transformer.h:
+    attn = block.attn
+    lambda_params.extend([attn.lambda_q1, attn.lambda_k1, attn.lambda_q2, attn.lambda_k2])
+
+# Collect other parameters for Muon optimizer
+all_h_params = list(raw_model.transformer.h.parameters())
+params_for_muon = [p for p in all_h_params if p not in lambda_params]
+
+# Optimizer for lm_head.parameters()
+optimizer1 = torch.optim.AdamW(
+    raw_model.lm_head.parameters(),
+    lr=args.learning_rate,
+    betas=(0.9, 0.95),
+    weight_decay=args.weight_decay,
+    fused=True
+)
+
+# Optimizer for transformer.h.parameters() excluding 'lambda' parameters
+optimizer2 = Muon(
+    params_for_muon,
+    lr=0.1 * args.learning_rate,
+    momentum=0.95,
+    rank=ddp_rank,
+    world_size=ddp_world_size
+)
+
+# Optimizer for 'lambda' parameters
+optimizer3 = torch.optim.AdamW(
+    lambda_params,
+    lr=args.learning_rate,
+    betas=(0.9, 0.95),
+    weight_decay=args.weight_decay,
+    fused=True
+)
+optimizers = [optimizer1, optimizer2, optimizer3]
+# Learning rate schedulers
+def get_lr(it):
+    assert it <= args.num_iterations
+    if it < args.warmup_iters:
+        return (it + 1) / args.warmup_iters
+    elif it < args.num_iterations - args.warmdown_iters:
+        return 1.0
+    else:
+        decay_ratio = (args.num_iterations - it) / args.warmdown_iters
+        return decay_ratio
+
+# Schedulers for each optimizer
+schedulers = [
+    torch.optim.lr_scheduler.LambdaLR(optimizer1, get_lr),
+    torch.optim.lr_scheduler.LambdaLR(optimizer2, get_lr),
+    torch.optim.lr_scheduler.LambdaLR(optimizer3, get_lr)
+]
+
 # Learning rate decay scheduler (linear warmup and warmdown)
 def get_lr(it):
     assert it <= args.num_iterations
@@ -601,17 +651,28 @@ for step in range(args.num_iterations + 1):
             loss.backward()
     for p in model.parameters():
         p.grad /= train_accumulation_steps
+
+
+
     # Step the optimizers and schedulers
     for opt, sched in zip(optimizers, schedulers):
         opt.step()
         sched.step()
     # Null the gradients
     model.zero_grad(set_to_none=True)
-    # --------------- TRAINING SECTION END -------------------
+    # --------------- TRAINING SECTION END -------------
+# everything that follows now is just diagnostics, prints, logging, etc.
 
-    if master_process:
-        approx_time = training_time_ms + 1000 * (time.time() - t0)
-        print(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms "
-              f"step_avg:{approx_time/timed_steps:.2f}ms")
-        with open(logfile, "a") as f:
-            f.write(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms\n")
+#dist.all_reduce(train_loss, op=dist.ReduceOp.AVG) # all-reducing the training loss would be more correct in terms of logging, but slower
+if master_process:
+    approx_time = training_time_ms + 1000 * (time.time() - t0)
+    print(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
+    with open(logfile, "a") as f:
+        f.write(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms\n")
+
+if master_process:
+    print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
+
+# -------------------------------------------------------------------------
+# clean up nice
+dist.destroy_process_group()
