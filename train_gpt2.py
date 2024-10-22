@@ -155,86 +155,104 @@ def apply_rotary_emb(x, cos, sin):
     y2 = x1 * (-sin) + x2 * cos
     return torch.cat([y1, y2], 3).type_as(x)
 
-def lambda_init_fn(depth):
-    return 0.8 - 0.6 * math.exp(-0.3 * depth)
-
 class DifferentialCausalSelfAttention(nn.Module):
-
     def __init__(self, config, layer_idx):
         super().__init__()
         self.n_head = config.n_head
         self.n_embd = config.n_embd
-        self.head_dim = self.n_embd // self.n_head // 2  # Divide by 2 for differential attention
-        assert self.n_embd % self.n_head == 0
+        self.head_dim = self.n_embd // self.n_head // 2
+        assert self.n_embd % (self.n_head * 2) == 0, "Embedding dimension must be divisible by 2 * n_head"
         self.depth = layer_idx
 
-        # Linear projections
+        # Linear Projections
         self.c_q = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.c_k = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.c_v = nn.Linear(self.n_embd, self.n_embd, bias=False)
-        # output projection
+
+        # Output Projection
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
-        self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
+        self.c_proj.weight.data.zero_()
+
+        # Rotary embedding
         self.rotary = Rotary(self.head_dim)
 
-        # Lambda parameters (For differential attention)
-        self.lambda_init = lambda_init_fn(self.depth)
-        self.lambda_q1 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
-        self.lambda_k1 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
-        self.lambda_q2 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
-        self.lambda_k2 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
-        
-        self.subln = nn.RMSNorm(2 * self.head_dim, eps=1e-5)  # dim corresponds to model dimension
-    
+        # Differential attention initialization
+        self.lambda_init = 0.8 - 0.6 * math.exp(-0.3 * self.depth)
+
+        # Differential attention parameters
+        self.lambda_q1 = nn.Parameter(torch.randn(self.head_dim) * 0.1)
+        self.lambda_k1 = nn.Parameter(torch.randn(self.head_dim) * 0.1)
+        self.lambda_q2 = nn.Parameter(torch.randn(self.head_dim) * 0.1)
+        self.lambda_k2 = nn.Parameter(torch.randn(self.head_dim) * 0.1)
+
+        # Normalization layer (per-head)
+        self.subln = nn.LayerNorm(2 * self.head_dim, elementwise_affine=False)
+
     def forward(self, x):
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-        # Compute query, key, and value projections
+        B, T, C = x.size()
+
+        # Project x to queries, keys, values
+        q = self.c_q(x)
+        k = self.c_k(x)
+        v = self.c_v(x)
 
         # Reshape for differential attention
-        q = self.q_proj(x)
-        k = self.k_proj(x)
-        v = self.v_proj(x)
+        q = q.view(B, T, 2 * self.n_head, self.head_dim)
+        k = k.view(B, T, 2 * self.n_head, self.head_dim)
+        v = v.view(B, T, self.n_head, 2 * self.head_dim)
 
-        q = q.view(B, T, 2 * self.num_heads, self.head_dim)
-        k = k.view(B, T, 2 * self.num_kv_heads, self.head_dim)
-        v = v.view(B, T, self.num_kv_heads, 2 * self.head_dim)
-
+        # Apply rotary embeddings
         cos, sin = self.rotary(q)
-        q = F.rms_norm(q, (q.size(-1),)) 
-        k = F.rms_norm(k, (k.size(-1),)) # QK norm suggested by @Grad62304977
-        
+        q = F.rms_norm(q, (q.size(-1),))
+        k = F.rms_norm(k, (k.size(-1),))
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
-        
-        q *= self.scaling
 
-        attn_weights = torch.matmul(q, k.transpose(-1, -2))
+        # Transpose for attention computation
+        q = q.transpose(1, 2)  # (B, 2*n_head, T, head_dim)
+        k = k.transpose(1, 2)  # (B, 2*n_head, T, head_dim)
+        v = v.transpose(1, 2)  # (B, n_head, T, 2*head_dim)
 
-        # if attn_mask is None:
-        #     attn_mask = torch.triu(
-        #         torch.zeros([T, T])
-        #         .float()
-        #         .fill_(float("-inf"))
-        #         .type_as(attn_weights),
-        #         1,
-        #     )
-        # attn_weights = torch.nan_to_num(attn_weights)
-        # attn_weights += attn_mask   
+        # Scale queries
+        q = q * (1.0 / math.sqrt(self.head_dim))
+
+        # Compute attention weights
+        attn_weights = torch.matmul(q, k.transpose(-2, -1))
+
+        # Apply causal mask
+        attn_mask = torch.triu(torch.ones(T, T), diagonal=1).bool().to(attn_weights.device)
+        attn_weights = attn_weights.masked_fill(attn_mask, float('-inf'))
+
+        # Apply softmax
         attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).type_as(attn_weights)
 
-        lambda_1 = torch.exp(torch.sum(self.lambda_q1 * self.lambda_k1, dim=-1).float()).type_as(q)
-        lambda_2 = torch.exp(torch.sum(self.lambda_q2 * self.lambda_k2, dim=-1).float()).type_as(q)
-        lambda_full = lambda_1 - lambda_2 + self.lambda_init
-        attn_weights = attn_weights.view(B, self.num_heads, 2, T, T)
-        attn_weights = attn_weights[:, :, 0] - lambda_full * attn_weights[:, :, 1]
-        
-        attn = torch.matmul(attn_weights, v)
-        attn = self.subln(attn)
-        attn = attn * (1 - self.lambda_init)
-        attn = attn.transpose(1, 2).reshape(B, T, self.num_heads * 2 * self.head_dim)
+        # Reshape attention weights to separate components
+        attn_weights = attn_weights.view(B, self.n_head, 2, T, T)
 
-        attn = self.c_proj(attn)
+        # Compute lambda values
+        lambda_1 = torch.exp(torch.sum(self.lambda_q1 * self.lambda_k1)).type_as(q)
+        lambda_2 = torch.exp(torch.sum(self.lambda_q2 * self.lambda_k2)).type_as(q)
+        lambda_full = lambda_1 - lambda_2 + self.lambda_init
+
+        # Differential attention weights
+        attn_weights = attn_weights[:, :, 0] - lambda_full * attn_weights[:, :, 1]
+
+        # Compute attention output
+        attn_output = torch.matmul(attn_weights, v)
+
+        # Apply normalization per head
+        attn_output = attn_output.view(B * self.n_head, T, 2 * self.head_dim)
+        attn_output = self.subln(attn_output)
+        attn_output = attn_output.view(B, self.n_head, T, 2 * self.head_dim)
+
+        # Scale output
+        attn_output = attn_output * (1 - self.lambda_init)
+
+        # Reshape and project output
+        attn_output = attn_output.transpose(1, 2).contiguous().view(B, T, C)
+        attn = self.c_proj(attn_output)
         return attn
+
 
 
 class MLP(nn.Module):
