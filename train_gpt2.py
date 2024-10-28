@@ -91,49 +91,49 @@ class Muon(torch.optim.Optimizer):
         self.rank = rank
         self.world_size = world_size
 
-def step(self):
-    for group in self.param_groups:
-        lr = group['lr']
-        momentum = group['momentum']
-        zeropower_backend = zeropower_backends[group['backend']]
+    def step(self):
+        for group in self.param_groups:
+            lr = group['lr']
+            momentum = group['momentum']
+            zeropower_backend = zeropower_backends[group['backend']]
 
-        # Generate weight updates in distributed fashion
-        updates = []
-        param_shapes = []
-        for i, p in enumerate(group['params']):
-            g = p.grad
-            if g is None or len(g.shape) != 2:
-                # Create a placeholder tensor of zeros for skipped parameters
-                updates.append(torch.zeros_like(p.data, dtype=torch.bfloat16))
+            # Generate weight updates in distributed fashion
+            updates = []
+            param_shapes = []
+            for i, p in enumerate(group['params']):
+                g = p.grad
+                if g is None or len(g.shape) != 2:
+                    # Create a placeholder tensor of zeros for skipped parameters
+                    updates.append(torch.zeros_like(p.data, dtype=torch.bfloat16))
+                    param_shapes.append(p.data.shape)
+                    continue
+                state = self.state[p]
+                if 'momentum_buffer' not in state:
+                    state['momentum_buffer'] = torch.zeros_like(g)
+                buf = state['momentum_buffer']
+                buf.mul_(momentum).add_(g)
+                if group['nesterov']:
+                    g = g.add(buf, alpha=momentum)
+                # Process gradient
+                g = zeropower_backend(g, steps=group['backend_steps'])
+                g *= max(g.size(0), g.size(1)) ** 0.5
+                updates.append(g.to(torch.bfloat16))
                 param_shapes.append(p.data.shape)
-                continue
-            state = self.state[p]
-            if 'momentum_buffer' not in state:
-                state['momentum_buffer'] = torch.zeros_like(g)
-            buf = state['momentum_buffer']
-            buf.mul_(momentum).add_(g)
-            if group['nesterov']:
-                g = g.add(buf, alpha=momentum)
-            # Process gradient
-            g = zeropower_backend(g, steps=group['backend_steps'])
-            g *= max(g.size(0), g.size(1)) ** 0.5
-            updates.append(g.to(torch.bfloat16))
-            param_shapes.append(p.data.shape)
 
-        # Flatten all updates and concatenate
-        updates_flat = torch.cat([u.flatten() for u in updates])
+            # Flatten all updates and concatenate
+            updates_flat = torch.cat([u.flatten() for u in updates])
 
-        # Sync updates across devices
-        dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
+            # Sync updates across devices
+            dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
 
-        # Deserialize and apply updates
-        offset = 0
-        for p, shape in zip(group['params'], param_shapes):
-            numel = p.numel()
-            g_flat = updates_flat[offset:offset + numel]
-            g = g_flat.view(shape).type_as(p.data)
-            p.data.add_(g, alpha=-lr)
-            offset += numel
+            # Deserialize and apply updates
+            offset = 0
+            for p, shape in zip(group['params'], param_shapes):
+                numel = p.numel()
+                g_flat = updates_flat[offset:offset + numel]
+                g = g_flat.view(shape).type_as(p.data)
+                p.data.add_(g, alpha=-lr)
+                offset += numel
 
 
 # -----------------------------------------------------------------------------
