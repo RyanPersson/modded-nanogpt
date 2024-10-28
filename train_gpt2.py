@@ -91,50 +91,50 @@ class Muon(torch.optim.Optimizer):
         self.rank = rank
         self.world_size = world_size
 
-    def step(self):
-        for group in self.param_groups:
-            lr = group['lr']
-            momentum = group['momentum']
-            zeropower_backend = zeropower_backends[group['backend']]
+def step(self):
+    for group in self.param_groups:
+        lr = group['lr']
+        momentum = group['momentum']
+        zeropower_backend = zeropower_backends[group['backend']]
 
-            # Generate weight updates in distributed fashion
-            total_params = sum(p.numel() for p in group['params'])
-            updates_flat = torch.zeros(total_params, device='cuda', dtype=torch.bfloat16)
-            curr_idx = 0
-            for i, p in enumerate(group['params']):
-                # Distribute parameters across GPUs
-                if i % self.world_size == self.rank:
-                    g = p.grad
-                    if g is None:
-                        curr_idx += p.numel()
-                        continue
-                    if len(g.shape) != 2:
-                        print(f"Skipping gradient for param with shape: {g.shape}, not 2D.")
-                        curr_idx += p.numel()  # Move the index forward, skip this gradient
-                        continue
-                    state = self.state[p]
-                    if 'momentum_buffer' not in state:
-                        state['momentum_buffer'] = torch.zeros_like(g)
-                    buf = state['momentum_buffer']
-                    buf.mul_(momentum).add_(g)
-                    if group['nesterov']:
-                        g = g.add(buf, alpha=momentum)
-                    # print(f"Processing gradient for param with shape: {g.shape}")
-                    g = zeropower_backend(g, steps=group['backend_steps'])
-                    g *= max(g.size(0), g.size(1)) ** 0.5  # scale to have update.square().mean() == 1
-                    updates_flat[curr_idx:curr_idx+p.numel()] = g.flatten()
-                curr_idx += p.numel()
+        # Generate weight updates in distributed fashion
+        updates = []
+        param_shapes = []
+        for i, p in enumerate(group['params']):
+            g = p.grad
+            if g is None or len(g.shape) != 2:
+                # Create a placeholder tensor of zeros for skipped parameters
+                updates.append(torch.zeros_like(p.data, dtype=torch.bfloat16))
+                param_shapes.append(p.data.shape)
+                continue
+            state = self.state[p]
+            if 'momentum_buffer' not in state:
+                state['momentum_buffer'] = torch.zeros_like(g)
+            buf = state['momentum_buffer']
+            buf.mul_(momentum).add_(g)
+            if group['nesterov']:
+                g = g.add(buf, alpha=momentum)
+            # Process gradient
+            g = zeropower_backend(g, steps=group['backend_steps'])
+            g *= max(g.size(0), g.size(1)) ** 0.5
+            updates.append(g.to(torch.bfloat16))
+            param_shapes.append(p.data.shape)
 
-            # Sync updates across devices
-            dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
+        # Flatten all updates and concatenate
+        updates_flat = torch.cat([u.flatten() for u in updates])
 
-            # Deserialize and apply updates
-            curr_idx = 0
-            for p in group['params']:
-                g = updates_flat[curr_idx:curr_idx+p.numel()].view_as(p.data).type_as(p.data)
-                # print(f"Applying update for param with shape: {g.shape}")
-                p.data.add_(g, alpha=-lr)
-                curr_idx += p.numel()
+        # Sync updates across devices
+        dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
+
+        # Deserialize and apply updates
+        offset = 0
+        for p, shape in zip(group['params'], param_shapes):
+            numel = p.numel()
+            g_flat = updates_flat[offset:offset + numel]
+            g = g_flat.view(shape).type_as(p.data)
+            p.data.add_(g, alpha=-lr)
+            offset += numel
+
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the GPT-2 model
@@ -449,6 +449,8 @@ args = Hyperparameters()
 
 # Set up DDP (distributed data parallel). torchrun sets this env variable
 assert torch.cuda.is_available()
+torch.autograd.set_detect_anomaly(True) # May delete this later
+
 dist.init_process_group(backend='nccl')
 ddp_rank = int(os.environ['RANK'])
 ddp_local_rank = int(os.environ['LOCAL_RANK'])
@@ -655,6 +657,8 @@ for step in range(args.num_iterations + 1):
         else:
             loss.backward()
     for p in model.parameters():
+        if p.grad is not None and torch.isnan(p.grad).any():
+            print(f"NaN detected in gradients of parameter {p.shape}")
         p.grad /= train_accumulation_steps
 
 
