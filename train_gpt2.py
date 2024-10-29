@@ -536,9 +536,7 @@ optimizer1 = torch.optim.AdamW(
 optimizer2 = Muon(
     params_for_muon,
     lr=0.1 * args.learning_rate,
-    momentum=0.95,
-    rank=ddp_rank,
-    world_size=ddp_world_size
+    momentum=0.95
 )
 
 # Optimizer for 'lambda' parameters
@@ -562,26 +560,6 @@ def get_lr(it):
         decay_ratio = (args.num_iterations - it) / args.warmdown_iters
         return decay_ratio
 
-# Schedulers for each optimizer
-schedulers = [
-    torch.optim.lr_scheduler.LambdaLR(optimizer1, get_lr),
-    torch.optim.lr_scheduler.LambdaLR(optimizer2, get_lr),
-    torch.optim.lr_scheduler.LambdaLR(optimizer3, get_lr)
-]
-
-# Learning rate decay scheduler (linear warmup and warmdown)
-def get_lr(it):
-    assert it <= args.num_iterations
-    # 1) Linear warmup for warmup_iters steps
-    if it < args.warmup_iters:
-        return (it + 1) / args.warmup_iters
-    # 2) Constant lr for a while
-    elif it < args.num_iterations - args.warmdown_iters:
-        return 1.0
-    # 3) Linear warmdown
-    else:
-        decay_ratio = (args.num_iterations - it) / args.warmdown_iters
-        return decay_ratio
 schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
 
 # Begin logging
