@@ -1,7 +1,7 @@
 import os
 import sys
 with open(sys.argv[0]) as f:
-    code = f.read()  # read the code of this file ASAP, for logging
+    code = f.read() # read the code of this file ASAP, for logging
 import uuid
 import glob
 import time
@@ -27,20 +27,18 @@ def zeropower_via_svd(G, steps=None):
 @torch.compile
 def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
     """
-    Newton-Schulz iteration to compute the zeroth power / orthogonalization of G.
-    We opt to use a quintic iteration whose coefficients are selected to maximize
-    the slope at zero. For the purpose of minimizing steps, it turns out to be
-    empirically effective to keep increasing the slope at zero even beyond the
-    point where the iteration no longer converges all the way to one everywhere
-    on the interval. This iteration therefore does not produce UV^T but rather
-    something like US'V^T where S' is diagonal with S_{ii}' ~ Uniform(0.5, 1.5),
-    which turns out not to hurt model performance at all relative to UV^T, where
-    USV^T = G is the SVD.
+    Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
+    quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
+    of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
+    zero even beyond the point where the iteration no longer converges all the way to one everywhere
+    on the interval. This iteration therefore does not produce UV^T but rather something like US'V^T
+    where S' is diagonal with S_{ii}' \sim Uniform(0.5, 1.5), which turns out not to hurt model
+    performance at all relative to UV^T, where USV^T = G is the SVD.
     """
-    assert len(G.shape) == 2, f"Expected 2D tensor, got {G.shape}"
-    a, b, c = (3.4445, -4.7750, 2.0315)
+    assert len(G.shape) == 2
+    a, b, c = (3.4445, -4.7750,  2.0315)
     X = G.bfloat16()
-    X /= (X.norm() + eps)  # ensure top singular value <= 1
+    X /= (X.norm() + eps) # ensure top singular value <= 1
     if G.size(0) > G.size(1):
         X = X.T
     for _ in range(steps):
@@ -49,30 +47,26 @@ def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
         X = a * X + b * B + c * A @ B
     if G.size(0) > G.size(1):
         X = X.T
-    # print(f"Exiting zeropower_via_newtonschulz5 with tensor of shape: {X.shape}")
     return X
 
 zeropower_backends = dict(svd=zeropower_via_svd, newtonschulz5=zeropower_via_newtonschulz5)
 
 class Muon(torch.optim.Optimizer):
     """
-    Muon - MomentUm Orthogonalized by Newton-Schulz
+    Muon - MomentUm Orthogonalized by Newton-schulz
 
-    Muon internally runs standard SGD-momentum, and then performs an orthogonalization
-    post-processing step, in which each 2D parameter's update is replaced with the nearest
-    orthogonal matrix. To efficiently orthogonalize each update, we use a Newton-Schulz
-    iteration, which has the advantage that it can be stably run in bfloat16 on the GPU.
+    Muon internally runs standard SGD-momentum, and then performs an orthogonalization post-
+    processing step, in which each 2D parameter's update is replaced with the nearest orthogonal
+    matrix. To efficiently orthogonalize each update, we use a Newton-Schulz iteration, which has
+    the advantage that it can be stably run in bfloat16 on the GPU.
 
     Some warnings:
     - This optimizer assumes that all parameters passed in are 2D.
-    - It should not be used for the embedding layer, the final fully connected layer,
-      or any {0,1}-D parameters; those should all be optimized by a standard method
-      (e.g., AdamW).
-    - To use it with 4D convolutional filters, it works well to just flatten their last
-      3 dimensions.
+    - It should not be used for the embedding layer, the final fully connected layer, or any {0,1}-D
+    parameters; those should all be optimized by a standard method (e.g., AdamW).
+    - To use it with 4D convolutional filters, it works well to just flatten their last 3 dimensions.
     - We believe it is unlikely to work well for training with small batch size.
-    - We believe it may not work well for finetuning pretrained models, but we haven't
-      tested this.
+    - We believe it may not work well for finetuning pretrained models, but we haven't tested this.
     - We have not yet tried this optimizer for training scenarios larger than NanoGPT (124M).
 
     Arguments:
@@ -82,59 +76,33 @@ class Muon(torch.optim.Optimizer):
         backend: The chosen backend for the orthogonalization step. (recommended: 'newtonschulz5')
         backend_steps: The number of iteration steps to use in the backend, if it is iterative.
     """
-    def __init__(self, params, lr=3e-4, momentum=0.95, nesterov=True,
-                 backend='newtonschulz5', backend_steps=5,
-                 rank=0, world_size=1):
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov,
-                        backend=backend, backend_steps=backend_steps)
+    def __init__(self, params, lr=3e-4, momentum=0.95, nesterov=True, backend='newtonschulz5', backend_steps=5):
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, backend=backend, backend_steps=backend_steps)
         super().__init__(params, defaults)
-        self.rank = rank
-        self.world_size = world_size
 
     def step(self):
         for group in self.param_groups:
             lr = group['lr']
             momentum = group['momentum']
             zeropower_backend = zeropower_backends[group['backend']]
-
-            # Generate weight updates in distributed fashion
-            total_params = sum(p.numel() for p in group['params'])
-            updates_flat = torch.zeros(total_params, device='cuda', dtype=torch.bfloat16)
-            curr_idx = 0
-            for i, p in enumerate(group['params']):
-                # Distribute parameters across GPUs
-                if i % self.world_size == self.rank:
-                    g = p.grad
-                    if g is None:
-                        curr_idx += p.numel()
-                        continue
-                    if len(g.shape) != 2:
-                        print(f"Skipping gradient for param with shape: {g.shape}, not 2D.")
-                        curr_idx += p.numel()  # Move the index forward, skip this gradient
-                        continue
-                    state = self.state[p]
-                    if 'momentum_buffer' not in state:
-                        state['momentum_buffer'] = torch.zeros_like(g)
-                    buf = state['momentum_buffer']
-                    buf.mul_(momentum).add_(g)
-                    if group['nesterov']:
-                        g = g.add(buf, alpha=momentum)
-                    # print(f"Processing gradient for param with shape: {g.shape}")
-                    g = zeropower_backend(g, steps=group['backend_steps'])
-                    g *= max(g.size(0), g.size(1)) ** 0.5  # scale to have update.square().mean() == 1
-                    updates_flat[curr_idx:curr_idx+p.numel()] = g.flatten()
-                curr_idx += p.numel()
-
-            # Sync updates across devices
-            dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
-
-            # Deserialize and apply updates
-            curr_idx = 0
             for p in group['params']:
-                g = updates_flat[curr_idx:curr_idx+p.numel()].view_as(p.data).type_as(p.data)
-                # print(f"Applying update for param with shape: {g.shape}")
-                p.data.add_(g, alpha=-lr)
-                curr_idx += p.numel()
+                g = p.grad
+                if g is None:
+                    continue
+                state = self.state[p]
+                if 'momentum_buffer' not in state:
+                    state['momentum_buffer'] = torch.zeros_like(g)
+                buf = state['momentum_buffer']
+                buf.mul_(momentum).add_(g)
+                if group['nesterov']:
+                    g = g.add(buf, alpha=momentum)
+                if g.size(0) == 3 * g.size(1): # split grouped QKV parameters
+                    g = torch.cat([zeropower_backend(g1, steps=group['backend_steps']) for g1 in g.split(g.size(1))])
+                    scale = g.size(1)**0.5
+                else:
+                    g = zeropower_backend(g, steps=group['backend_steps'])
+                    scale = max(g.size(0), g.size(1))**0.5 # scale to have update.square().mean() == 1
+                p.data.add_(g, alpha=-lr * scale)
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the GPT-2 model
@@ -154,13 +122,13 @@ class Rotary(torch.nn.Module):
             self.seq_len_cached = seq_len
             t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
             freqs = torch.outer(t, self.inv_freq).to(x.device)
-            self.cos_cached = freqs.cos().to(dtype=x.dtype)
-            self.sin_cached = freqs.sin().to(dtype=x.dtype)
+            self.cos_cached = freqs.cos().bfloat16()
+            self.sin_cached = freqs.sin().bfloat16()
         return self.cos_cached[None, :, None, :], self.sin_cached[None, :, None, :]
 
 def apply_rotary_emb(x, cos, sin):
-    assert x.ndim == 4  # multihead attention
-    d = x.shape[3] // 2
+    assert x.ndim == 4 # multihead attention
+    d = x.shape[3]//2
     x1 = x[..., :d]
     x2 = x[..., d:]
     y1 = x1 * cos + x2 * sin
@@ -172,112 +140,45 @@ class DifferentialCausalSelfAttention(nn.Module):
         super().__init__()
         self.n_head = config.n_head
         self.n_embd = config.n_embd
-        self.head_dim = self.n_embd // self.n_head // 2
-        assert self.n_embd % (self.n_head * 2) == 0, "Embedding dimension must be divisible by 2 * n_head"
-        self.depth = layer_idx
-
-        # Linear Projections
+        self.head_dim = self.n_embd // self.n_head
+        assert self.n_embd % self.n_head == 0
         self.c_q = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.c_k = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.c_v = nn.Linear(self.n_embd, self.n_embd, bias=False)
-
-        # Output Projection
+        # output projection
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
-        self.c_proj.weight.data.zero_()
-
-        # Rotary embedding
+        self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
         self.rotary = Rotary(self.head_dim)
 
-        # Differential attention initialization
-        self.lambda_init = 0.8 - 0.6 * math.exp(-0.3 * self.depth)
-
-        # Differential attention parameters
-        self.lambda_q1 = nn.Parameter(torch.randn(self.head_dim) * 0.1)
-        self.lambda_k1 = nn.Parameter(torch.randn(self.head_dim) * 0.1)
-        self.lambda_q2 = nn.Parameter(torch.randn(self.head_dim) * 0.1)
-        self.lambda_k2 = nn.Parameter(torch.randn(self.head_dim) * 0.1)
-
-        # Normalization layers
-        self.q_rmsnorm = nn.RMSNorm(self.head_dim, elementwise_affine=False)
-        self.k_rmsnorm = nn.RMSNorm(self.head_dim, elementwise_affine=False)
-        self.subln = nn.LayerNorm(2 * self.head_dim, elementwise_affine=False)
-
     def forward(self, x):
-        B, T, C = x.size()
-
-        # Project x to queries, keys, values
-        q = self.c_q(x)
-        k = self.c_k(x)
-        v = self.c_v(x)
-
-        # Reshape for differential attention
-        q = q.view(B, T, 2 * self.n_head, self.head_dim)
-        k = k.view(B, T, 2 * self.n_head, self.head_dim)
-        v = v.view(B, T, self.n_head, 2 * self.head_dim)
-
+        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
+        k = self.c_k(x).view(B, T, self.n_head, self.head_dim)
+        v = self.c_v(x).view(B, T, self.n_head, self.head_dim)
+        
         # Apply rotary embeddings
         cos, sin = self.rotary(q)
-        q = self.q_rmsnorm(q)
-        k = self.k_rmsnorm(k)
+        q = F.rms_norm(q, (q.size(-1),)), 
+        k = F.rms_norm(k, (k.size(-1),)) # QK norm suggested by @Grad62304977
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
 
-        # Transpose for attention computation
-        q = q.transpose(1, 2)  # (B, 2*n_head, T, head_dim)
-        k = k.transpose(1, 2)  # (B, 2*n_head, T, head_dim)
-        v = v.transpose(1, 2)  # (B, n_head, T, 2*head_dim)
-
-        # Scale queries
-        q = q * (1.0 / math.sqrt(self.head_dim))
-
-        # Compute attention weights
-        attn_weights = torch.matmul(q, k.transpose(-2, -1))  # (B, 2*n_head, T, T)
-
-        # Apply causal mask
-        attn_mask = torch.triu(torch.ones(T, T), diagonal=1).bool().to(attn_weights.device)
-        attn_weights = attn_weights.masked_fill(attn_mask, float('-inf'))
-
-        # Apply softmax
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).type_as(attn_weights)
-
-        # Reshape attention weights to separate components
-        attn_weights = attn_weights.view(B, self.n_head, 2, T, T)
-
-        # Compute lambda values
-        lambda_1 = torch.exp(torch.sum(self.lambda_q1 * self.lambda_k1)).type_as(q)
-        lambda_2 = torch.exp(torch.sum(self.lambda_q2 * self.lambda_k2)).type_as(q)
-        lambda_full = lambda_1 - lambda_2 + self.lambda_init
-
-        # Differential attention weights
-        attn_weights = attn_weights[:, :, 0] - lambda_full * attn_weights[:, :, 1]
-
-        # Compute attention output
-        attn_output = torch.matmul(attn_weights, v)
-
-        # Apply normalization per head
-        attn_output = attn_output.view(B * self.n_head, T, 2 * self.head_dim)
-        attn_output = self.subln(attn_output)
-        attn_output = attn_output.view(B, self.n_head, T, 2 * self.head_dim)
-
-        # Scale output
-        attn_output = attn_output * (1 - self.lambda_init)
-
-        # Reshape and project output
-        attn_output = attn_output.transpose(1, 2).contiguous().view(B, T, C)
-        attn = self.c_proj(attn_output)
-        return attn
+        y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
+        y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
+        y = self.c_proj(y)
+        return y
 
 class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.c_fc   = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
-        self.c_proj.weight.data.zero_()  # zero init suggested by @Grad62304977
+        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
+        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        self.c_proj.weight.data.zero_() # zero init suggested by @Grad62304977
 
     def forward(self, x):
         x = self.c_fc(x)
-        x = F.relu(x).square()  # ~1-2% better than GELU
+        x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
         x = self.c_proj(x)
         return x
 
@@ -287,12 +188,10 @@ class Block(nn.Module):
         super().__init__()
         self.attn = DifferentialCausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
-        self.ln1 = nn.RMSNorm(config.n_embd, elementwise_affine=False)
-        self.ln2 = nn.RMSNorm(config.n_embd, elementwise_affine=False)
 
     def forward(self, x):
-        x = x + self.attn(self.ln1(x))
-        x = x + self.mlp(self.ln2(x))
+        x = x + self.attn(F.rms_norm(x, (x.size(-1),)))
+        x = x + self.mlp(F.rms_norm(x, (x.size(-1),)))
         return x
 
 # -----------------------------------------------------------------------------
@@ -316,30 +215,28 @@ class GPT(nn.Module):
             h   = nn.ModuleList([Block(config, layer_idx=i) for i in range(config.n_layer)]),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        self.transformer.wte.weight = self.lm_head.weight  # weight tying
-        self.ln_f = nn.RMSNorm(config.n_embd, elementwise_affine=False)
+        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
     def forward(self, idx, targets=None, return_logits=True):
 
-        # Forward the GPT model itself
-        x = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
+        # forward the GPT model itself
+        x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         for block in self.transformer.h:
             x = block(x)
-        x = self.ln_f(x)
+        x = F.rms_norm(x, (x.size(-1),))
 
         if targets is not None:
-            # If we are given some desired targets also calculate the loss
+            # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
-            logits = logits.float()  # use tf32/fp32 for logits
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)),
-                                   targets.view(-1), ignore_index=-1)
+            logits = logits.float() # use tf32/fp32 for logits
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
-            # Inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :])  # preserve the time dim
-            logits = logits.float()  # use tf32/fp32 for logits
+            # inference-time mini-optimization: only forward the lm_head on the very last position
+            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            logits = logits.float() # use tf32/fp32 for logits
             loss = None
 
-        # There are performance reasons why not returning logits is prudent, if not needed
+        # there are performance reasons why not returning logits is prudent, if not needed
         if not return_logits:
             logits = None
 
@@ -349,10 +246,10 @@ class GPT(nn.Module):
 # Our own simple Distributed Data Loader
 
 def _peek_data_shard(filename):
-    # Only reads the header, returns header data
+    # only reads the header, returns header data
     with open(filename, "rb") as f:
-        # First read the header, which is 256 int32 integers (4 bytes each)
-        header = np.frombuffer(f.read(256 * 4), dtype=np.int32)
+        # first read the header, which is 256 int32 integers (4 bytes each)
+        header = np.frombuffer(f.read(256*4), dtype=np.int32)
     if header[0] != 20240520:
         print("ERROR: magic number mismatch in the data .bin file!")
         print("---> HINT: Are you passing in a correct file with --input_bin?")
@@ -360,17 +257,17 @@ def _peek_data_shard(filename):
         print("---> HINT: For example re-run: `python dev/data/tinyshakespeare.py`, then re-try")
         exit(1)
     assert header[1] == 1, "unsupported version"
-    ntok = header[2]  # number of tokens (claimed)
-    return ntok  # for now just return the number of tokens
+    ntok = header[2] # number of tokens (claimed)
+    return ntok # for now just return the number of tokens
 
 def _load_data_shard(filename):
     with open(filename, "rb") as f:
-        # First read the header, which is 256 int32 integers (4 bytes each)
-        header = np.frombuffer(f.read(256 * 4), dtype=np.int32)
+        # first read the header, which is 256 int32 integers (4 bytes each)
+        header = np.frombuffer(f.read(256*4), dtype=np.int32)
         assert header[0] == 20240520, "magic number mismatch in the data .bin file"
         assert header[1] == 1, "unsupported version"
-        ntok = header[2]  # number of tokens (claimed)
-        # The rest of it are tokens, stored as uint16
+        ntok = header[2] # number of tokens (claimed)
+        # the rest of it are tokens, stored as uint16
         tokens = np.frombuffer(f.read(), dtype=np.uint16)
     assert len(tokens) == ntok, "number of tokens read does not match header?"
     return tokens
@@ -382,11 +279,11 @@ class DistributedDataLoader:
         self.B = B
         self.T = T
 
-        # Glob files that match the pattern
+        # glob files that match the pattern
         self.files = sorted(glob.glob(filename_pattern))
         assert len(self.files) > 0, f"did not find any files that match the pattern {filename_pattern}"
 
-        # Load and validate all data shards, count number of tokens in total
+        # load and validate all data shards, count number of tokens in total
         ntok_total = 0
         for fname in self.files:
             shard_ntok = _peek_data_shard(fname)
@@ -394,7 +291,7 @@ class DistributedDataLoader:
             ntok_total += int(shard_ntok)
         self.ntok_total = ntok_total
 
-        # Kick things off
+        # kick things off
         self.reset()
 
     def reset(self):
@@ -402,7 +299,7 @@ class DistributedDataLoader:
         self.current_position = self.process_rank * self.B * self.T
         self.tokens = _load_data_shard(self.files[self.current_shard])
 
-    def advance(self):  # advance to next data shard
+    def advance(self): # advance to next data shard
         self.current_shard = (self.current_shard + 1) % len(self.files)
         self.current_position = self.process_rank * self.B * self.T
         self.tokens = _load_data_shard(self.files[self.current_shard])
@@ -410,15 +307,11 @@ class DistributedDataLoader:
     def next_batch(self):
         B = self.B
         T = self.T
-        end_position = self.current_position + B * T + 1
-        if end_position > len(self.tokens):
-            self.advance()
-            return self.next_batch()
-        buf = self.tokens[self.current_position:end_position]
+        buf = self.tokens[self.current_position : self.current_position+B*T+1]
         buf = torch.tensor(buf.astype(np.int32), dtype=torch.long)
-        x = (buf[:-1]).view(B, T)  # inputs
-        y = (buf[1:]).view(B, T)   # targets
-        # Advance current position and load next shard if necessary
+        x = (buf[:-1]).view(B, T) # inputs
+        y = (buf[1:]).view(B, T) # targets
+        # advance current position and load next shard if necessary
         self.current_position += B * T * self.num_processes
         if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
             self.advance()
@@ -429,25 +322,25 @@ class DistributedDataLoader:
 
 @dataclass
 class Hyperparameters:
-    # Data hyperparameters
-    input_bin: str = 'data/fineweb10B/fineweb_train_*.bin'  # input .bin to train on
-    input_val_bin: str = 'data/fineweb10B/fineweb_val_*.bin'  # input .bin to eval validation loss on
-    # Optimization hyperparameters
-    batch_size: int = 8 * 64  # batch size, in sequences, across all devices
-    device_batch_size: int = 64  # batch size, in sequences, per device
-    sequence_length: int = 1024  # sequence length, in tokens
-    num_iterations: int = 5100  # number of iterations to run
-    learning_rate: float = 0.0036
-    warmup_iters: int = 0
-    warmdown_iters: int = 1450  # number of iterations of linear warmup/warmdown
-    weight_decay: float = 0
-    # Evaluation and logging hyperparameters
-    val_loss_every: int = 125  # every how many steps to evaluate val loss?
-    val_tokens: int = 10485760  # how many tokens of validation data?
-    save_every: int = 0  # every how many steps to save the checkpoint?
+    # data hyperparams
+    input_bin : str = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
+    input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
+    # optimization hyperparams
+    batch_size : int = 8*64 # batch size, in sequences, across all devices
+    device_batch_size : int = 64 # batch size, in sequences, per device
+    sequence_length : int = 1024 # sequence length, in tokens
+    num_iterations : int = 5100 # number of iterations to run
+    learning_rate : float = 0.0036
+    warmup_iters : int = 0
+    warmdown_iters : int = 1450 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
+    weight_decay : float = 0
+    # evaluation and logging hyperparams
+    val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
+    val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
+    save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
 args = Hyperparameters()
 
-# Set up DDP (distributed data parallel). torchrun sets this env variable
+# set up DDP (distributed data parallel). torchrun sets this env variable
 assert torch.cuda.is_available()
 dist.init_process_group(backend='nccl')
 ddp_rank = int(os.environ['RANK'])
@@ -456,18 +349,18 @@ ddp_world_size = int(os.environ['WORLD_SIZE'])
 device = f'cuda:{ddp_local_rank}'
 torch.cuda.set_device(device)
 print(f"using device: {device}")
-master_process = (ddp_rank == 0)  # this process will do logging, checkpointing etc.
+master_process = (ddp_rank == 0) # this process will do logging, checkpointing etc.
 
-# Convenience variables
+# convenience variables
 B, T = args.device_batch_size, args.sequence_length
-# Calculate the number of steps to take in the val loop.
+# calculate the number of steps to take in the val loop.
 assert args.val_tokens % (B * T * ddp_world_size) == 0
 val_steps = args.val_tokens // (B * T * ddp_world_size)
-# Calculate the steps of gradient accumulation required to attain the desired global batch size.
+# calculate the steps of gradient accumulation required to attain the desired global batch size.
 assert args.batch_size % (B * ddp_world_size) == 0
 train_accumulation_steps = args.batch_size // (B * ddp_world_size)
 
-# Load tokens
+# load tokens
 train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
 val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
 if master_process:
@@ -475,19 +368,18 @@ if master_process:
     print(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
 x, y = train_loader.next_batch()
 
-# There are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
+# there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
+# this originates from Karpathy's experiments.
 num_vocab = 50304
 model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
 model = model.cuda()
 if hasattr(config, "coordinate_descent_tuning"):
-    config.coordinate_descent_tuning = True  # suggested by @Chillee
+    config.coordinate_descent_tuning = True # suggested by @Chillee
 model = torch.compile(model)
-# Wrap model into DDP container
+# here we wrap model into DDP container
 model = DDP(model, device_ids=[ddp_local_rank])
-raw_model = model.module  # always contains the "raw" unwrapped model
+raw_model = model.module # always contains the "raw" unwrapped model
 ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
-
-# Initialize the optimizer(s)
 
 # Collect 'lambda' parameters
 lambda_params = []
@@ -533,10 +425,13 @@ optimizers = [optimizer1, optimizer2, optimizer3]
 # Learning rate schedulers
 def get_lr(it):
     assert it <= args.num_iterations
+    # 1) linear warmup for warmup_iters steps
     if it < args.warmup_iters:
-        return (it + 1) / args.warmup_iters
+        return (it+1) / args.warmup_iters
+    # 2) constant lr for a while
     elif it < args.num_iterations - args.warmdown_iters:
         return 1.0
+    # 3) linear warmdown
     else:
         decay_ratio = (args.num_iterations - it) / args.warmdown_iters
         return decay_ratio
@@ -547,133 +442,119 @@ schedulers = [
     torch.optim.lr_scheduler.LambdaLR(optimizer2, get_lr),
     torch.optim.lr_scheduler.LambdaLR(optimizer3, get_lr)
 ]
-
-# Learning rate decay scheduler (linear warmup and warmdown)
-def get_lr(it):
-    assert it <= args.num_iterations
-    # 1) Linear warmup for warmup_iters steps
-    if it < args.warmup_iters:
-        return (it + 1) / args.warmup_iters
-    # 2) Constant lr for a while
-    elif it < args.num_iterations - args.warmdown_iters:
-        return 1.0
-    # 3) Linear warmdown
-    else:
-        decay_ratio = (args.num_iterations - it) / args.warmdown_iters
-        return decay_ratio
-schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
-
-# Begin logging
+# begin logging
 if master_process:
     run_id = str(uuid.uuid4())
     logdir = 'logs/%s/' % run_id
     os.makedirs(logdir, exist_ok=True)
     logfile = 'logs/%s.txt' % run_id
-    # Create the log file
+    # create the log file
     with open(logfile, "w") as f:
-        # Begin the log by printing this file (the Python code)
-        f.write('=' * 100 + '\n')
+        # begin the log by printing this file (the Python code)
+        f.write('='*100 + '\n')
         f.write(code)
-        f.write('=' * 100 + '\n')
-        # Log information about the hardware/software environment
+        f.write('='*100 + '\n')
+        # log information about the hardware/software environment this is running on
+        # and print the full `nvidia-smi` to file
         f.write(f"Running pytorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}\nnvidia-smi:\n")
         import subprocess
         result = subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         f.write(f'{result.stdout}\n')
-        f.write('=' * 100 + '\n')
+        f.write('='*100 + '\n')
 
 training_time_ms = 0
-# Start the clock
+# start the clock
 torch.cuda.synchronize()
 t0 = time.time()
-# Begin training
+# begin training
 train_loader.reset()
 for step in range(args.num_iterations + 1):
     last_step = (step == args.num_iterations)
-    # Ignore timing first 10 steps
+    # This effectively ignores timing first 10 steps, which are slower for weird reasons.
+    # Alternately, and slightly more correctly in terms of benchmarking, we could do 10
+    # steps with dummy data first, and then re-initialize the model and reset the loader.
     if step == 10:
         training_time_ms = 0
         t0 = time.time()
-    timed_steps = float('nan') if step <= 11 else (step - 10) + 1
+    timed_steps = float('nan') if step <= 11 else (step - 10) + 1 # <= 11 to avoid bug in val
 
-    # Evaluate the validation dataset
+    # once in a while evaluate the validation dataset
     if (last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)):
-        # Stop the clock
+        # stop the clock
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.time() - t0)
-        # Run validation batches
+        # run validation batches
         model.eval()
         val_loader.reset()
         val_loss = 0.0
         for _ in range(val_steps):
             x_val, y_val = val_loader.next_batch()
-            with ctx:
+            with ctx: # of course, we'd like to use no_grad() here too, but that creates a torch.compile error for some reason
                 _, loss = model(x_val, y_val, return_logits=False)
                 val_loss += loss.detach()
                 del loss
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         val_loss /= val_steps
-        # Log val loss to console and to logfile
+        # log val loss to console and to logfile
         if master_process:
             print(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms '
                   f'step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
             with open(logfile, "a") as f:
-                f.write(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms '
-                        f'step_avg:{training_time_ms/(timed_steps-1):.2f}ms\n')
-        # Start the clock again
+                f.write(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms\n')
+        # start the clock again
         torch.cuda.synchronize()
         t0 = time.time()
 
     if master_process and (last_step or (args.save_every > 0 and step % args.save_every == 0)):
-        # Stop the clock
+        # stop the clock
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.time() - t0)
-        # Save the state of the training process
-        log = dict(step=step, code=code, model=raw_model.state_dict(),
-                   optimizers=[opt.state_dict() for opt in optimizers])
+        # save the state of the training process
+        log = dict(step=step, code=code, model=raw_model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
         torch.save(log, 'logs/%s/state_step%06d.pt' % (run_id, step))
-        # Start the clock again
+        # start the clock again
         torch.cuda.synchronize()
         t0 = time.time()
 
+    # bit confusing: we want to make sure to eval on 0th iteration
+    # but also after the very last iteration. so we loop for step <= num_iterations
+    # instead of just < num_iterations (one extra due to <=), only to do
+    # the validation/sampling one last time, and then we break right here as we're done.
     if last_step:
         break
 
     # --------------- TRAINING SECTION BEGIN -----------------
     model.train()
-    for i in range(1, train_accumulation_steps + 1):
-        # Forward pass
+    for i in range(1, train_accumulation_steps+1):
+        # forward pass
         with ctx:
             _, loss = model(x, y, return_logits=False)
             train_loss = loss.detach()
-        # Advance the dataset for the next batch
+        # advance the dataset for the next batch
         x, y = train_loader.next_batch()
-        # Backward pass
+        # backward pass
         if i < train_accumulation_steps:
-            with model.no_sync():
+            with model.no_sync(): # there's no need to sync gradients every accumulation step
                 loss.backward()
         else:
-            loss.backward()
+            loss.backward() # just sync on the last step
     for p in model.parameters():
         p.grad /= train_accumulation_steps
-
-
-
-    # Step the optimizers and schedulers
+    # step the optimizers and schedulers
     for opt, sched in zip(optimizers, schedulers):
         opt.step()
         sched.step()
-    # Null the gradients
+    # null the gradients
     model.zero_grad(set_to_none=True)
-    # --------------- TRAINING SECTION END -------------
-# everything that follows now is just diagnostics, prints, logging, etc.
+    # --------------- TRAINING SECTION END -------------------
+    # everything that follows now is just diagnostics, prints, logging, etc.
 
-#dist.all_reduce(train_loss, op=dist.ReduceOp.AVG) # all-reducing the training loss would be more correct in terms of logging, but slower
-if master_process:
-    approx_time = training_time_ms + 1000 * (time.time() - t0)
-    print(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
-    with open(logfile, "a") as f:
-        f.write(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms\n")
+    #dist.all_reduce(train_loss, op=dist.ReduceOp.AVG) # all-reducing the training loss would be more correct in terms of logging, but slower
+    if master_process:
+        approx_time = training_time_ms + 1000 * (time.time() - t0)
+        print(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
+        with open(logfile, "a") as f:
+            f.write(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms\n")
 
 if master_process:
     print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
