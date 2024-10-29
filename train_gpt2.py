@@ -135,82 +135,87 @@ def apply_rotary_emb(x, cos, sin):
     y2 = x1 * (-sin) + x2 * cos
     return torch.cat([y1, y2], 3).type_as(x)
 
-class DifferentialCausalSelfAttention(nn.Module):
-    def __init__(self, config, layer_idx):
-        super().__init__()
+def lambda_init_fn(depth):
+    return 0.8 - 0.6 * math.exp(-0.3 * depth)
 
-        self.embed_dim = config.n_embd
-        self.num_heads = config.n_head
-        self.num_heads = self.num_heads // 2
-        assert self.embed_dim % self.num_heads == 0
-        self.head_dim = self.embed_dim // self.num_heads // 2
+
+class DifferentialCausalSelfAttention(nn.Module):
+    """
+    DiffAttn implemented with FlashAttention, for packages that does not support different qk/v dimensions
+    e.g., flash-attention (https://github.com/Dao-AILab/flash-attention)
+    """
+    def __init__(
+        self,
+        config,
+        layer_idx,
+    ):
+        super().__init__()
+        self.d_model = config.n_embd# d_model
+        # num_heads set to half of Transformer's num_heads since Differential attention "duplicates heads" in two copies
+        self.num_heads = config.n_head // 2
+        # self.num_kv_heads = args.decoder_kv_attention_heads // args.model_parallel_size if args.decoder_kv_attention_heads is not None else num_heads // args.model_parallel_size
+        
+        self.head_dim = self.d_model // self.num_heads 
         self.scaling = self.head_dim ** -0.5
         
-        self.q_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=False)
-        self.k_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=False)
-        self.v_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=False)
-        self.out_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=False)
+        self.q_proj = nn.Linear(self.d_model, self.d_model, bias=False)
+        self.k_proj = nn.Linear(self.d_model, self.d_model, bias=False)
+        self.v_proj = nn.Linear(self.d_model, self.d_model, bias=False)
+        self.out_proj = nn.Linear(self.d_model, self.d_model, bias=False)
 
-        self.lambda_init = 0.8 - 0.6 * math.exp(-0.3 * layer_idx)
+        self.lambda_init = lambda_init_fn(layer_idx)
         self.lambda_q1 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
         self.lambda_k1 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
         self.lambda_q2 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
         self.lambda_k2 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
 
-        self.subln = nn.RMSNorm(2 * self.head_dim, eps=1e-5, elementwise_affine=True)
+        self.subln = nn.RMSNorm(2 * self.head_dim, eps=1e-5, elementwise_affine=True) # 2 x 128
+        self.rotary = Rotary(self.head_dim) # Not exactly sure if this should be head_dim or 2x head_dim with diffattn #todo
     
     def forward(
         self,
         x,
+        rel_pos,
+        attn_mask=None,
     ):
-        B, T, C = x.size()
+        bsz, tgt_len, d_model = x.size()
 
-        q = self.q_proj(x)
-        k = self.k_proj(x)
-        v = self.v_proj(x)
+        q = self.q_proj(x) # T x 768
+        k = self.k_proj(x) # T x 768
+        v = self.v_proj(x) # T x 768
 
-        q = q.view(B, T, 2 * self.num_heads, self.head_dim)
-        k = k.view(B, T, 2 * self.num_heads, self.head_dim)
-        v = v.view(B, T, self.num_heads, 2 * self.head_dim)
-
-        # Apply rotary embeddings
+        q = q.view(bsz, tgt_len, 2 * self.num_heads, self.head_dim) # T x 6 x 128
+        k = k.view(bsz, tgt_len, 2 * self.num_heads, self.head_dim) # T x 6 x 128
+        v = v.view(bsz, tgt_len, self.num_heads, 2, self.head_dim) # T x 3 x 2 x 128
         cos, sin = self.rotary(q)
-        q = F.rms_norm(q, (q.size(-1),)), 
-        k = F.rms_norm(k, (k.size(-1),)) # QK norm suggested by @Grad62304977
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
 
 
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-        q *= self.scaling
-        attn_weights = torch.matmul(q, k.transpose(-1, -2))
-        if attn_mask is None:
-            attn_mask = torch.triu(
-                torch.zeros([T, T])
-                .float()
-                .fill_(float("-inf"))
-                .type_as(attn_weights),
-                1,
-            )
-        attn_weights = torch.nan_to_num(attn_weights)
-        attn_weights += attn_mask   
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).type_as(
-            attn_weights
-        )
+        q = q.reshape(bsz, tgt_len, self.num_heads, 2, self.head_dim) # T x 3 x 2 x 128
+        k = k.reshape(bsz, tgt_len, self.num_heads, 2, self.head_dim) # T x 3 x 2 x 128
 
+        q1, q2 = q[:, :, :, 0], q[:, :, :, 1] # T x 3 x 2 x 128 (NOt sure on size)
+        k1, k2 = k[:, :, :, 0], k[:, :, :, 1] # T x 3 x 128
+        v1, v2 = v[:, :, :, 0], v[:, :, :, 1] # T x 3 x 128
+
+        attn11 = F.scaled_dot_product_attention(q1, k1, v1, causal=True) # 
+        attn12 = F.scaled_dot_product_attention(q1, k1, v2, causal=True) # 
+        attn1 = torch.cat([attn11, attn12], dim=-1) # 
+        
+        attn21 = F.scaled_dot_product_attention(q2, k2, v1, causal=True) # 
+        attn22 = F.scaled_dot_product_attention(q2, k2, v2, causal=True) # 
+        attn2 = torch.cat([attn21, attn22], dim=-1) # 
+        
         lambda_1 = torch.exp(torch.sum(self.lambda_q1 * self.lambda_k1, dim=-1).float()).type_as(q)
         lambda_2 = torch.exp(torch.sum(self.lambda_q2 * self.lambda_k2, dim=-1).float()).type_as(q)
         lambda_full = lambda_1 - lambda_2 + self.lambda_init
-        attn_weights = attn_weights.view(B, self.num_heads, 2, T, T)
-        attn_weights = attn_weights[:, :, 0] - lambda_full * attn_weights[:, :, 1]
-        
-        attn = torch.matmul(attn_weights, v)
-        attn = self.subln(attn)
-        attn = attn * (1 - self.lambda_init)
-        attn = attn.transpose(1, 2).reshape(B, T, self.num_heads * 2 * self.head_dim)
+        attn = attn1 - lambda_full * attn2 # 
 
+        attn = self.subln(attn) #  (doesn't change shape)
+        attn = attn * (1 - self.lambda_init) #  (doesn't change shape)
+        attn = attn.reshape(bsz, tgt_len, self.num_heads * 2 * self.head_dim) # last dim is 3 x 2 x 128
+        
         attn = self.out_proj(attn)
         return attn
 
