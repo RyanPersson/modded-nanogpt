@@ -16,6 +16,9 @@ import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 import math
 
+# Set this to True to enable debugging prints
+debugF = False
+debugB = False
 
 # -----------------------------------------------------------------------------
 # Muon optimizer
@@ -43,13 +46,16 @@ def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
     X /= (X.norm() + eps)  # ensure top singular value <= 1
     if G.size(0) > G.size(1):
         X = X.T
-    for _ in range(steps):
+    for step in range(steps):
         A = X @ X.T
         B = A @ X
         X = a * X + b * B + c * A @ B
+        if debugB and step == 0:
+            print(f"[zeropower_via_newtonschulz5] Step {step}: X shape {X.shape}")
     if G.size(0) > G.size(1):
         X = X.T
-    # print(f"Exiting zeropower_via_newtonschulz5 with tensor of shape: {X.shape}")
+    if debugB:
+        print(f"[zeropower_via_newtonschulz5] Exiting with tensor of shape: {X.shape}")
     return X
 
 zeropower_backends = dict(svd=zeropower_via_svd, newtonschulz5=zeropower_via_newtonschulz5)
@@ -92,12 +98,12 @@ class Muon(torch.optim.Optimizer):
         self.world_size = world_size
 
     def step(self):
-        for group in self.param_groups:
+        for group_idx, group in enumerate(self.param_groups):
             lr = group['lr']
             momentum = group['momentum']
             zeropower_backend = zeropower_backends[group['backend']]
 
-            # Generate weight updates in distributed fashion
+            # Generate weight updates
             updates = []
             param_shapes = []
             for i, p in enumerate(group['params']):
@@ -106,7 +112,13 @@ class Muon(torch.optim.Optimizer):
                     # Create a placeholder tensor of zeros for skipped parameters
                     updates.append(torch.zeros_like(p.data, dtype=torch.bfloat16))
                     param_shapes.append(p.data.shape)
+                    if debugB and g is None:
+                        print(f"[Muon Step] Param idx {i}: Gradient is None, skipping.")
+                    elif debugB:
+                        print(f"[Muon Step] Param idx {i}: Gradient shape {g.shape} is not 2D, skipping.")
                     continue
+                if debugB:
+                    print(f"[Muon Step] Processing param idx {i} with shape {p.shape}")
                 state = self.state[p]
                 if 'momentum_buffer' not in state:
                     state['momentum_buffer'] = torch.zeros_like(g)
@@ -123,18 +135,22 @@ class Muon(torch.optim.Optimizer):
             # Flatten all updates and concatenate
             updates_flat = torch.cat([u.flatten() for u in updates])
 
+            if debugB:
+                print(f"[Muon Step] updates_flat size: {updates_flat.size()}")
+
             # Sync updates across devices
             dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
 
             # Deserialize and apply updates
             offset = 0
-            for p, shape in zip(group['params'], param_shapes):
+            for i, (p, shape) in enumerate(zip(group['params'], param_shapes)):
                 numel = p.numel()
                 g_flat = updates_flat[offset:offset + numel]
                 g = g_flat.view(shape).type_as(p.data)
                 p.data.add_(g, alpha=-lr)
                 offset += numel
-
+                if debugB:
+                    print(f"[Muon Step] Applied update to param idx {i}, shape {p.shape}")
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the GPT-2 model
@@ -156,6 +172,8 @@ class Rotary(torch.nn.Module):
             freqs = torch.outer(t, self.inv_freq).to(x.device)
             self.cos_cached = freqs.cos().to(dtype=x.dtype)
             self.sin_cached = freqs.sin().to(dtype=x.dtype)
+            if debugF:
+                print(f"[Rotary] Cached cos and sin with shapes: {self.cos_cached.shape}, {self.sin_cached.shape}")
         return self.cos_cached[None, :, None, :], self.sin_cached[None, :, None, :]
 
 def apply_rotary_emb(x, cos, sin):
@@ -204,16 +222,22 @@ class DifferentialCausalSelfAttention(nn.Module):
 
     def forward(self, x):
         B, T, C = x.size()
+        if debugF:
+            print(f"[DifferentialCausalSelfAttention] Layer {self.depth}, Input x shape: {x.shape}")
 
         # Project x to queries, keys, values
         q = self.c_q(x)
         k = self.c_k(x)
         v = self.c_v(x)
+        if debugF:
+            print(f"[DifferentialCausalSelfAttention] q, k, v shapes: {q.shape}, {k.shape}, {v.shape}")
 
         # Reshape for differential attention
         q = q.view(B, T, 2 * self.n_head, self.head_dim)
         k = k.view(B, T, 2 * self.n_head, self.head_dim)
         v = v.view(B, T, self.n_head, 2 * self.head_dim)
+        if debugF:
+            print(f"[DifferentialCausalSelfAttention] Reshaped q, k, v shapes: {q.shape}, {k.shape}, {v.shape}")
 
         # Apply rotary embeddings
         cos, sin = self.rotary(q)
@@ -226,12 +250,16 @@ class DifferentialCausalSelfAttention(nn.Module):
         q = q.transpose(1, 2)  # (B, 2*n_head, T, head_dim)
         k = k.transpose(1, 2)  # (B, 2*n_head, T, head_dim)
         v = v.transpose(1, 2)  # (B, n_head, T, 2*head_dim)
+        if debugF:
+            print(f"[DifferentialCausalSelfAttention] Transposed q, k, v shapes: {q.shape}, {k.shape}, {v.shape}")
 
         # Scale queries
         q = q * (1.0 / math.sqrt(self.head_dim))
 
         # Compute attention weights
         attn_weights = torch.matmul(q, k.transpose(-2, -1))  # (B, 2*n_head, T, T)
+        if debugF:
+            print(f"[DifferentialCausalSelfAttention] attn_weights shape: {attn_weights.shape}")
 
         # Apply causal mask
         attn_mask = torch.triu(torch.ones(T, T), diagonal=1).bool().to(attn_weights.device)
@@ -242,22 +270,32 @@ class DifferentialCausalSelfAttention(nn.Module):
 
         # Reshape attention weights to separate components
         attn_weights = attn_weights.view(B, self.n_head, 2, T, T)
+        if debugF:
+            print(f"[DifferentialCausalSelfAttention] Reshaped attn_weights shape: {attn_weights.shape}")
 
         # Compute lambda values
         lambda_1 = torch.exp(torch.sum(self.lambda_q1 * self.lambda_k1)).type_as(q)
         lambda_2 = torch.exp(torch.sum(self.lambda_q2 * self.lambda_k2)).type_as(q)
         lambda_full = lambda_1 - lambda_2 + self.lambda_init
+        if debugF:
+            print(f"[DifferentialCausalSelfAttention] lambda_1: {lambda_1.item()}, lambda_2: {lambda_2.item()}, lambda_full: {lambda_full.item()}")
 
         # Differential attention weights
         attn_weights = attn_weights[:, :, 0] - lambda_full * attn_weights[:, :, 1]
+        if debugF:
+            print(f"[DifferentialCausalSelfAttention] Differential attn_weights shape: {attn_weights.shape}")
 
         # Compute attention output
         attn_output = torch.matmul(attn_weights, v)
+        if debugF:
+            print(f"[DifferentialCausalSelfAttention] attn_output shape before normalization: {attn_output.shape}")
 
         # Apply normalization per head
         attn_output = attn_output.view(B * self.n_head, T, 2 * self.head_dim)
         attn_output = self.subln(attn_output)
         attn_output = attn_output.view(B, self.n_head, T, 2 * self.head_dim)
+        if debugF:
+            print(f"[DifferentialCausalSelfAttention] attn_output shape after normalization: {attn_output.shape}")
 
         # Scale output
         attn_output = attn_output * (1 - self.lambda_init)
@@ -265,6 +303,8 @@ class DifferentialCausalSelfAttention(nn.Module):
         # Reshape and project output
         attn_output = attn_output.transpose(1, 2).contiguous().view(B, T, C)
         attn = self.c_proj(attn_output)
+        if debugF:
+            print(f"[DifferentialCausalSelfAttention] Output attn shape: {attn.shape}")
         return attn
 
 class MLP(nn.Module):
@@ -279,6 +319,8 @@ class MLP(nn.Module):
         x = self.c_fc(x)
         x = F.relu(x).square()  # ~1-2% better than GELU
         x = self.c_proj(x)
+        if debugF:
+            print(f"[MLP] Output x shape: {x.shape}")
         return x
 
 class Block(nn.Module):
@@ -291,8 +333,12 @@ class Block(nn.Module):
         self.ln2 = nn.RMSNorm(config.n_embd, elementwise_affine=False)
 
     def forward(self, x):
+        if debugF:
+            print(f"[Block] Layer {self.attn.depth}, Input x shape: {x.shape}")
         x = x + self.attn(self.ln1(x))
         x = x + self.mlp(self.ln2(x))
+        if debugF:
+            print(f"[Block] Layer {self.attn.depth}, Output x shape: {x.shape}")
         return x
 
 # -----------------------------------------------------------------------------
@@ -323,9 +369,13 @@ class GPT(nn.Module):
 
         # Forward the GPT model itself
         x = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
+        if debugF:
+            print(f"[GPT] Input embeddings x shape: {x.shape}")
         for block in self.transformer.h:
             x = block(x)
         x = self.ln_f(x)
+        if debugF:
+            print(f"[GPT] Final x shape after transformer: {x.shape}")
 
         if targets is not None:
             # If we are given some desired targets also calculate the loss
@@ -333,6 +383,8 @@ class GPT(nn.Module):
             logits = logits.float()  # use tf32/fp32 for logits
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)),
                                    targets.view(-1), ignore_index=-1)
+            if debugF:
+                print(f"[GPT] Calculated loss: {loss.item()}")
         else:
             # Inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :])  # preserve the time dim
@@ -656,6 +708,22 @@ for step in range(args.num_iterations + 1):
                 loss.backward()
         else:
             loss.backward()
+            # Inside the training loop, after loss.backward()
+
+    # Check for NaNs in gradients and print gradient statistics
+    for name, p in model.named_parameters():
+        if p.grad is not None:
+            if torch.isnan(p.grad).any():
+                print(f"[Training Loop] NaN detected in gradients of parameter '{name}' with shape {p.shape}")
+            if debugB:
+                grad_min = p.grad.min().item()
+                grad_max = p.grad.max().item()
+                grad_mean = p.grad.mean().item()
+                print(f"[Training Loop] Grad stats for param '{name}': min={grad_min}, max={grad_max}, mean={grad_mean}")
+        else:
+            if debugB:
+                print(f"[Training Loop] Gradient is None for parameter '{name}' with shape {p.shape}")
+
     for p in model.parameters():
         if p.grad is not None and torch.isnan(p.grad).any():
             print(f"NaN detected in gradients of parameter {p.shape}")
