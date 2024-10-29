@@ -153,8 +153,6 @@ class DifferentialCausalSelfAttention(nn.Module):
         self.d_model = config.n_embd# d_model
         # num_heads set to half of Transformer's num_heads since Differential attention "duplicates heads" in two copies
         self.num_heads = config.n_head // 2
-        # self.num_kv_heads = args.decoder_kv_attention_heads // args.model_parallel_size if args.decoder_kv_attention_heads is not None else num_heads // args.model_parallel_size
-        
         self.head_dim = self.d_model // self.num_heads 
         self.scaling = self.head_dim ** -0.5
         
@@ -174,9 +172,7 @@ class DifferentialCausalSelfAttention(nn.Module):
     
     def forward(
         self,
-        x,
-        rel_pos,
-        attn_mask=None,
+        x
     ):
         bsz, tgt_len, d_model = x.size()
 
