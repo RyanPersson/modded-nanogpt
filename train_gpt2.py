@@ -6,7 +6,7 @@ import uuid
 import glob
 import time
 from dataclasses import dataclass
-
+from soap import SOAP
 import numpy as np
 import torch
 from torch import nn
@@ -401,7 +401,8 @@ enable_math_sdp(False)
 # init the optimizer(s)
 optimizer1 = torch.optim.Adam([raw_model.transformer.wte.weight], lr=0.3,   betas=(0.9, 0.95), fused=True)
 optimizer2 = torch.optim.Adam([raw_model.lm_head.weight],         lr=0.002, betas=(0.9, 0.95), fused=True)
-optimizer3 = Muon(raw_model.transformer.h.parameters(),           lr=0.02,  momentum=0.95)
+optimizer3 = SOAP(raw_model.transformer.h.parameters(), lr = 3e-3, betas=(.95, .95), weight_decay=.01, precondition_frequency=10)
+# Muon(raw_model.transformer.h.parameters(),           lr=0.02,  momentum=0.95)
 optimizers = [optimizer1, optimizer2, optimizer3]
 # learning rate decay scheduler (linear warmup and warmdown)
 def get_lr(it):
